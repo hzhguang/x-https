@@ -1,0 +1,331 @@
+#include "https_client.h"
+#include "ssl_utils.h"
+#include "tcp_utils.h"
+#include "ev_utils.h"
+#include "log.h"
+#include "memory_pool.h"
+#include <llhttp.h>
+#include <openssl/ssl.h>
+#include <ev.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <arpa/inet.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <pthread.h>
+
+// Helper functions
+static int build_http_request(char *buffer, size_t buffer_size, http_method method, const char *path, const char *body, size_t body_length) {
+    static const char* method_array[] = {"GET", "POST", "DELETE", "PUT"};
+    const char* method_str = method_array[method];
+    snprintf(buffer, buffer_size,
+             "%s %s HTTP/1.1\r\n"
+             "Host: localhost\r\n"
+             "Connection: close\r\n"
+             "Content-Length: %zu\r\n"
+             "\r\n"
+             "%s",
+             method_str, path, body_length, body);
+    return strlen(buffer);
+}
+
+// Handle SSL errors
+static void handle_error(st_client_t *client, const char *context) {
+    int err = SSL_get_error(client->ssl, -1);
+    const char *error_message = "unknown ssl error";
+    switch (err) {
+        case SSL_ERROR_SSL:
+            error_message = "ssl library error";
+            break;
+        case SSL_ERROR_SYSCALL:
+            error_message = "system call error";
+            break;
+        case SSL_ERROR_ZERO_RETURN:
+            error_message = "ssl connection closed";
+            break;
+        default:
+            error_message = context;
+            break;
+    }
+    if (client->callbacks && client->callbacks->on_error) {
+        client->callbacks->on_error(client, error_message);
+    }
+}
+
+// llhttp callback functions
+static int on_message_begin(llhttp_t *parser) {
+    return 0;
+}
+
+static int on_status(llhttp_t *parser, const char *at, size_t length) {
+    return 0;
+}
+
+static int on_header_field(llhttp_t *parser, const char *at, size_t length) {
+    return 0;
+}
+
+static int on_header_value(llhttp_t *parser, const char *at, size_t length) {
+    return 0;
+}
+
+static int on_headers_complete(llhttp_t *parser) {
+    return 0;
+}
+
+static int on_body(llhttp_t *parser, const char *at, size_t length) {
+    st_client_t *client = (st_client_t *)parser->data;
+    if (client->response_length + length > BUFFER_SIZE) {
+        // Increase buffer size if needed
+        if (client->response_length + length > client->buffer_size) {
+            size_t new_size = client->buffer_size * 2;
+            while (client->response_length + length > new_size) {
+                new_size *= 2;
+            }
+            char *new_buffer = pool_alloc(client->pool, new_size);
+            if (!new_buffer) {
+                handle_error(client, "buffer reallocation failed");
+                return -1;
+            }
+            client->response_buffer = new_buffer;
+            client->buffer_size = new_size;
+        }
+    }
+    memcpy(client->response_buffer + client->response_length, at, length);
+    client->response_length += length;
+    return 0;
+}
+
+static int on_message_complete(llhttp_t *parser) {
+    st_client_t *client = (st_client_t *)parser->data;
+    pthread_mutex_lock(&client->mutex);
+    client->response_received = true;
+    pthread_cond_signal(&client->cond);
+    pthread_mutex_unlock(&client->mutex);
+    return 0;
+}
+
+// Read callback
+static void on_read(struct ev_loop *loop, struct ev_io *w, int revents) {
+    st_client_t *client = (st_client_t *)w->data;
+    char temp_buffer[INITIAL_BUFFER_SIZE];
+    int read = SSL_read(client->ssl, temp_buffer, sizeof(temp_buffer));
+
+    if (read <= 0) {
+        if (client->callbacks && client->callbacks->on_disconnected) {
+            client->callbacks->on_disconnected(client);
+        }
+        handle_error(client, "ssl read failed");
+        ev_io_stop(loop, w);
+        SSL_shutdown(client->ssl);
+        SSL_free(client->ssl);
+        close(w->fd);
+        destroy_memory_pool(client->pool); // Destroy memory pool
+        free(client);
+        return;
+    }
+
+    // Append received data to buffer
+    if (!client->buffer) {
+        client->buffer = pool_alloc(client->pool, INITIAL_BUFFER_SIZE);
+        if (!client->buffer) {
+            handle_error(client, "buffer allocation failed");
+            ev_io_stop(loop, w);
+            SSL_shutdown(client->ssl);
+            SSL_free(client->ssl);
+            close(w->fd);
+            free(client);
+            return;
+        }
+        client->buffer_size = INITIAL_BUFFER_SIZE;
+        client->buffer_offset = 0;
+    }
+
+    // Append received data to buffer
+    if (client->buffer_offset + read > client->buffer_size) {
+        size_t new_size = client->buffer_size * 2;
+        while (client->buffer_offset + read > new_size) {
+            new_size *= 2;
+        }
+        char *new_buffer = pool_alloc(client->pool, new_size);
+        if (!new_buffer) {
+            handle_error(client, "buffer reallocation failed");
+            ev_io_stop(loop, w);
+            SSL_shutdown(client->ssl);
+            SSL_free(client->ssl);
+            close(w->fd);
+            destroy_memory_pool(client->pool); // Destroy memory pool
+            free(client);
+            return;
+        }
+        client->buffer = new_buffer;
+        client->buffer_size = new_size;
+    }
+    memcpy(client->buffer + client->buffer_offset, temp_buffer, read);
+    client->buffer_offset += read;
+
+    // Parse data using llhttp
+    llhttp_errno_t err = llhttp_execute(&client->parser, client->buffer, client->buffer_offset);
+    if (err != HPE_OK) {
+        handle_error(client, "llhttp parse error");
+    } else {
+        if (client->callbacks && client->callbacks->on_data_received) {
+            client->callbacks->on_data_received(client, client->response_buffer, client->response_length);
+        }
+    }
+}
+
+// Send data to server
+bool send_data_to_server(st_client_t *client, const char *data, size_t length) {
+    log_debug("data:%s, length:%ld, client:%p", data, length, client);
+
+    int result = SSL_write(client->ssl, data, length);
+    if (result <= 0) {
+        int err = SSL_get_error(client->ssl, result);
+        const char *error_message = "unknown ssl write error";
+        switch (err) {
+            case SSL_ERROR_WANT_WRITE:
+            case SSL_ERROR_WANT_READ:
+                return false; // Operation did not complete; try again later.
+            default:
+                error_message = "SSL write failed";
+                break;
+        }
+        if (client->callbacks && client->callbacks->on_error) {
+            client->callbacks->on_error(client, error_message);
+        }
+        return false;
+    }
+    return true;
+}
+
+// Send HTTP request and wait for response
+bool send_http_request(st_client_t *client, http_method method, const char *path, const char *body, size_t body_length, char *response, size_t *response_length) {
+    char request_buffer[INITIAL_BUFFER_SIZE];
+    int request_length = build_http_request(request_buffer, sizeof(request_buffer), method, path, body, body_length);
+
+    // Lock mutex and send request
+    pthread_mutex_lock(&client->mutex);
+    client->response_received = false;
+    pthread_mutex_unlock(&client->mutex);
+
+    // request 
+    if (!send_data_to_server(client, request_buffer, request_length)) {
+        return false; // 发送失败
+    }
+
+    // Wait for response
+    pthread_mutex_lock(&client->mutex);
+    while (!client->response_received) {
+        pthread_cond_wait(&client->cond, &client->mutex);
+    }
+    pthread_mutex_unlock(&client->mutex);
+
+    // Copy response to output parameters
+    if (response && response_length) {
+        memcpy(response, client->response_buffer, client->response_length);
+        *response_length = client->response_length;
+    }
+
+    return true;
+}
+
+
+// Start HTTPS client 
+bool start_https_client(const char *host, int port, event_callbacks *callbacks) { 
+    memory_pool_t *pool = create_memory_pool(); 
+    if (!pool) { 
+        return false; 
+    }
+    SSL_CTX *ctx = init_client_ssl();
+    if (!ctx) {
+        destroy_memory_pool(pool);
+        return false;
+    }
+
+    int client_fd = create_client_socket(host, port);
+    if (client_fd < 0) {
+        cleanup_ssl(ctx);
+        destroy_memory_pool(pool);
+        return false;
+    }
+
+    SSL *ssl = SSL_new(ctx);
+    if (!ssl) {
+        log_error("SSL_new");
+        close(client_fd);
+        cleanup_ssl(ctx);
+        destroy_memory_pool(pool);
+        return false;
+    }
+
+    st_client_t *client = pool_alloc(pool, sizeof(st_client_t));
+    if (!client) {
+        log_error("malloc");
+        SSL_free(ssl);
+        close(client_fd);
+        cleanup_ssl(ctx);
+        destroy_memory_pool(pool);
+        return false;
+    }
+    client->client_fd = client_fd;
+    client->ssl = ssl;
+    client->callbacks = callbacks;
+    client->buffer = NULL;
+    client->buffer_size = 0;
+    client->buffer_offset = 0;
+    client->response_received = false;
+    client->response_length = 0;
+    client->pool = pool;
+
+    pthread_mutex_init(&client->mutex, NULL);
+    pthread_cond_init(&client->cond, NULL);
+
+    SSL_set_fd(ssl, client_fd);
+    if (SSL_connect(ssl) <= 0) {
+        handle_error(client, "SSL connect failed");
+        SSL_free(ssl);
+        close(client_fd);
+        cleanup_ssl(ctx);
+        destroy_memory_pool(pool);
+        free(client);
+        return false;
+    }
+
+    llhttp_settings_t settings = {0};
+    settings.on_message_begin = on_message_begin;
+    settings.on_status = on_status;
+    settings.on_header_field = on_header_field;
+    settings.on_header_value = on_header_value;
+    settings.on_headers_complete = on_headers_complete;
+    settings.on_body = on_body;
+    settings.on_message_complete = on_message_complete;
+    llhttp_init(&client->parser, HTTP_BOTH, &settings);
+    client->parser.data = client;
+
+    struct ev_loop *loop = init_event_loop();
+    struct ev_io io;
+    ev_io_init(&io, on_read, client_fd, EV_READ);
+    io.data = client;
+
+    log_debug("loop:%p,io:%p,ssl:%p,client:%p,client_fd:%d", loop, &io, ssl, client, client_fd);
+
+    // Directly call the connected callback
+    if (client->callbacks && client->callbacks->on_connected) {
+        client->callbacks->on_connected(client);
+    }
+
+    ev_io_start(loop, &io);
+    ev_run(loop, 0);
+
+    ev_io_stop(loop, &io);
+    close(client_fd);
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    cleanup_ssl(ctx);
+    destroy_memory_pool(pool);
+    free(client);
+    return true;
+}

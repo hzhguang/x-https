@@ -1,0 +1,7 @@
+[log]
+level=0
+[ssl]
+host=localhost
+port=4443
+cert=cert.pem
+key=key.pem
